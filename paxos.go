@@ -11,12 +11,53 @@ import (
 	"bufio"
 	"fmt"
 	"log"
+	"net/http"
+	"net/rpc"
 	"os"
 	"strings"
 	"strconv"
 )
 
-func Help() {
+type Request struct {
+	Message string
+}
+
+type Response struct {
+	Message string
+}
+
+type Replica struct {
+	Database map[string] string
+}
+
+func (replica *Replica) Ping(_ Request, response *Response) error {
+	response.Message = "PINGED"
+	log.Println("Got Pinged")
+	return nil
+}
+
+func call(address string, method string, request Request, response *Response) error {
+	client, err := rpc.DialHTTP("tcp", address)
+	if err != nil {
+		log.Println("rpc dial: ", err)
+		return err
+	}
+	defer client.Close()
+
+	err = client.Call("Replica."+method, request, response)
+	if err != nil {
+		log.Println("rpc call: ", err)
+		return err
+	}
+
+	return nil
+}
+
+func failure(f string) {
+	log.Println("Call",f,"has failed.")
+}
+
+func help() {
 	fmt.Println("==============================================================")
 	fmt.Println("                          COMMANDS")
 	fmt.Println("==============================================================")
@@ -27,6 +68,12 @@ func Help() {
 	fmt.Println("delete <key>       - Delete a value .")
 	fmt.Println("quit               - Quit the program.")
 	fmt.Println("==============================================================")
+}
+
+func usage() {
+	fmt.Println("Usage: ", os.Args[0], "[-v=<false>], [-l=<n>] <local_port> [<port1>...<portn>] ")
+	fmt.Println("     -v        Verbose. Dispay the details of the paxos messages. Default is false")
+	fmt.Println("     -l        Latency. Sets the latency between messages as a random duration between [n,2n)")
 }
 
 func readLine(readline chan string) {
@@ -41,9 +88,7 @@ func readLine(readline chan string) {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: ", os.Args[0], "[-v=<false>], [-l=<n>] <local_port> [<port1>...<portn>] ")
-		fmt.Println("     -v        Verbose. Dispay the details of the paxos messages. Default is false")
-		fmt.Println("     -l        Latency. Sets the latency between messages as a random duration between [n,2n)")
+		usage()
 		os.Exit(1)
 	}
 
@@ -71,7 +116,8 @@ func main() {
 			} else if arg == "-l" {
 				next = "latency"
 			} else {
-				fmt.Println("Invalide option: ", arg)
+				fmt.Println("Invalid option: ", arg)
+				usage()
 				os.Exit(1)
 			}
 		} else if myport == "" {
@@ -85,6 +131,21 @@ func main() {
 	fmt.Println("-L",latency)
 	fmt.Println("ME",myport)
 	fmt.Println("OTHERS",ports)
+
+	// Server Connections
+	replica := new(Replica)
+	rpc.Register(replica)
+	rpc.HandleHTTP()
+
+	//serverAddress := net.JoinHostPort("localhost", myport)
+	serverAddress := ":" + myport
+	go func() {
+		err := http.ListenAndServe(serverAddress, nil)
+		if err != nil {
+			fmt.Println(err.Error())
+			os.Exit(1)
+		}
+	}()
 
 	readline := make(chan string, 1)
 
@@ -100,9 +161,21 @@ func main() {
 		} else if strings.ToLower(l[0]) == "put" {
 		} else if strings.ToLower(l[0]) == "delete" {
 		} else if strings.ToLower(l[0]) == "ping" {
-				fmt.Println("PINGING ME!!!")
+			address := serverAddress
+			if len(l) > 1 && l[1] != "" {
+				address = ":" + l[1]
+			}
+			fmt.Println("PINGING",address[1:])
+			var resp Response
+			var req Request
+			err := call(address, "Ping", req, &resp)
+			if err != nil {
+				failure("Ping")
+				continue
+			}
+			log.Println(resp.Message)
 		} else {
-			Help()
+			help()
 		}
 	}
 }
