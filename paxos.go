@@ -53,13 +53,22 @@ type PPrepare struct {
 
 type PAccept struct {
 	N Sequence
+	V Command
+}
+
+type Decide struct {
+	Slot Slot
+	Value Command
 }
 
 type Request struct {
 	APrepare APrepare
 	Accept Accept
 	PPrepare PPrepare
+	PAccept PAccept
+	Decide Decide
 	Message string
+	Address string
 }
 
 type Response struct {
@@ -77,7 +86,7 @@ type Sequence struct {
 }
 
 func (seq Sequence) String() string {
-	return fmt.Sprintf("%d %s",seq.N, seq.Address)
+	return fmt.Sprintf("Sequence{N: %d, Address: %s}", seq.N, seq.Address)
 }
 
 func (this Sequence) Cmp(that Sequence) int {
@@ -99,7 +108,7 @@ type Command struct {
 }
 
 func (command Command) String() string {
-	return fmt.Sprintf("%d_%s: (%d) %s", command.Tag, command.Command, command.Sequence.String(), command.Address)
+	return fmt.Sprintf("Command{Tag: %d, Command: %s, Sequence: %s, Address: %s}", command.Tag, command.Command, command.Sequence.String(), command.Address)
 }
 
 func (this Command) Eq(that Command) bool {
@@ -107,7 +116,7 @@ func (this Command) Eq(that Command) bool {
 }
 
 type Slot struct {
-	PromiseNumber Seq // most recently promised sequence number
+	PromiseNumber Sequence // most recently promised sequence number
 	Accepted Command // Most recently accepted command
 	Decided bool // When it was decided
 	N int
@@ -154,7 +163,8 @@ If the slot is already decided (and this replica knows it), then it should retur
 In addition, it should send out a decide message to the caller (whose address is provided as a).
 */
 func (self *Replica) APrepare(req Request, resp *Response) error {
-	log.Println("I am trying to prepare")
+	logM("")
+	logM("Received prepare request from " + req.Address)
 	// TODO: What do you do with the slot?
 	args := req.APrepare
 	if self.Promised.Cmp(args.Seq) < 1 {
@@ -189,6 +199,8 @@ If the slot is already decided (and this replica knows it), then it should retur
 In addition, it should send out a decide message to the caller.
 */
 func (self *Replica) AAccept(req Request, resp *Response) error {
+	logM("")
+	logM("Received accept request from " + req.Address)
 	// TODO: What do you do with the slot?
 	args := req.Accept
 
@@ -232,7 +244,27 @@ func (self *Replica) AAccept(req Request, resp *Response) error {
 //	If this is the first time that this replica has learned about the decision for this slot,
 //	it should also check if it (and possibly slots after it) can now be applied.
 func (self *Replica) Decide(req Request, resp *Response) error {
+	logM("")
+	logM("Received decide message from " + req.Address)
+	args := req.Decide
+	// TODO: It would be good to check if y ou hav e already been notified of a decision,
+	// and if that decision contradicts this one.
+	// In that case, there is an error somewhere and a panic is appropriate.
+	// TODO: If this is the first time that this replica has learned about the decision for this slot,
+	// it should also check if it (and possibly slots after it) can now be applied.
+
+	log.Println("Deciding:", args.Value)
+	_, ok := self.Acks[args.Value.Key];
+	log.Println("OK:",args.Value.Key)
+	log.Println("OK:",self.Acks)
+	if ok {
+		self.Acks[args.Value.Key] <- args.Value.Command
+	}
+	// TODO: whenever a decision is applied, check if the command has a channel waiting for it by generating the same address/tag key and looking it up.
+		// if found send the result across the channel, then remove the channel from the map and throw it away
+		// if it isn't found, do nothing; the command was proposed on a different replica
 	return nil
+
 }
 
 /*
@@ -240,73 +272,88 @@ func (self *Replica) Decide(req Request, resp *Response) error {
  */
 
 func (self *Replica) PPrepare(req Request, resp *Response) error {
+	logM("")
+	args := req.PPrepare
+	var acceptance PAccept
+
 	round := 1
 	n := 1
 	rounds: for {
-		//args := req.PPrepare
-		//log.Println(args)
 
 		// Pick a Sequence value N
-		// TODO: REFACTOR This is not the same as the slot number
-		if n == 1 {
-			for k, v := range self.Slots {
-				if !v.Decided {
-					n = k
-					break
-				}
-			}
-		}
-
 		// Build the slot
 		sl := Slot{N: n}
 		// Build the sequence
 		se := Sequence{N: n, Address: self.Address}
+		args.Command.Sequence = se
+		logM("Proposing: " + args.Command.String())
+		logM("Proposing: Round:" + strconv.Itoa(round) + ", N:" + strconv.Itoa(n))
 
 		// Send a Prepare message out to the entire cell (using a go routine per replica)
-		var commands []Command
-		var promises []Sequence
-		var votes []bool
+		response := make(chan Response, len(self.Friends))
 		for _, v := range self.Friends {
-			go func(v string, slot Slot, sequence Sequence) {
-				req := Request{APrepare: APrepare{Slot: slot, Seq: sequence}}
+			go func(v string, slot Slot, sequence Sequence, response chan Response) {
+				req := Request{Address: self.Address, APrepare: APrepare{Slot: slot, Seq: sequence}}
 				var resp Response
-				err := call(getAddress(v), "APrepare", req, &resp)
+				err := call(v, "APrepare", req, &resp)
 				if err != nil {
 					failure("APrepare (from PPrepare)")
 					return
 				}
-				// TODO: Use a channel, we can assume that a majority WILL respond
-					// 	To receive from this do it in a forever loop
-				// TODO: track the highest-sequenced command that has already been accepted by one or more of the replicas
-				//log.Println("COMMAND N:", resp.Command.Sequence.N)
-				//log.Println("PROMISED N:", resp.Promised.N)
+				// Send the response over a channel, we can assume that a majority WILL respond
+				response <- resp
 
-				commands = append(commands, resp.Command)
-				promises = append(promises, resp.Promised)
-				votes = append(votes, resp.Okay)
-			}(v, sl, se)
+			}(v, sl, se, response)
 		}
-		time.Sleep(time.Second)
-		numVotes := 0
-		for _,v := range votes {
-			if v {
-				numVotes++
+
+		// Get responses from go routines (in a forever loop)
+		numYes := 0
+		highestN := 0
+		var highestCommand Command
+		for numVotes := 0; numVotes < len(self.Friends); numVotes++ {
+			// pull from the channel response
+			prepareResponse := <-response
+			//resp{Command, Promised, Okay}
+			if prepareResponse.Okay {
+				numYes++
+
+				// make note of the highest n value that any replica returns to you
+				// track the highest-sequenced command that has already been accepted by one or more of the replicas
+				if prepareResponse.Promised.N > highestN {
+					highestN = prepareResponse.Promised.N
+					highestCommand = prepareResponse.Command
+				}
+			}
+
+			// If I have a majority
+			if numYes >= majority(len(self.Friends)) {
+				break
 			}
 		}
-		log.Println(commands)
-		if numVotes >= majority(len(self.Friends)) {
-			// I have a majority
-				// TODO: select your value
+
+		// If I have a majority
+		if numYes >= majority(len(self.Friends)) {
+			// select your value
+			acceptance.V = args.Command
+			acceptance.N = se
+
 			// TODO: If one or more of those replicas that voted for you have already accepted a value,
 			//		you should pick the highest-numbered value from among them, i.e. the one that was accepted with the highest n value.
+			if highestCommand.Command != "" {
+				fmt.Println(acceptance.V)
+				acceptance.V = highestCommand
+				fmt.Println(acceptance.V)
+			}
 			// TODO: If none of the replicas that voted for you included a value, you can pick your own.
 
 			// TODO: In either case, you should associate the value you are about to send out for acceptance with your promised n
+			//self.Promised = se
+
 			break rounds
 		}
 
-		// TODO: make note of the highest n value that any replica returns to you
-		// 		and generate a larger n if necessary for a future round
+		// 	generate a larger n if necessary for a future round
+		n = highestN + 1
 
 		// To pause, pick a random amount of time between, say, 5ms and 10ms. If you fail again, pick a random sleep time between 10ms and 20ms
 		duration := float64(5 * round)
@@ -316,17 +363,82 @@ func (self *Replica) PPrepare(req Request, resp *Response) error {
 	}
 
 	// TODO: Call the proposer Accept method with the value and the sequence number
+	req.PAccept = acceptance
+	call(self.Address, "PAccept", req, resp)
 
 	return nil
 }
 
 func (self *Replica) PAccept(req Request, resp *Response) error {
 	args := req.PAccept
+	logM("")
+	logM("Received a proposal to accept request from " + req.Address)
+	logM("Proposing to accept " + args.V.String())
+
+	sl := Slot{N: args.N.N}
+	// Send an accept request to all replicas and gather the results
+	response := make(chan Response, len(self.Friends))
+	for _, v := range self.Friends {
+		go func(v string, slot Slot, sequence Sequence, command Command, response chan Response) {
+			req := Request{Address: self.Address, Accept: Accept{Slot: slot, Seq: sequence, Command: command}}
+			var resp Response
+			err := call(v, "AAccept", req, &resp)
+			if err != nil {
+				failure("AAccept (from PAccept)")
+				return
+			}
+			// Send the response over a channel, we can assume that a majority WILL respond
+			response <- resp
+
+		}(v, sl, args.N, args.V, response)
+	}
+
+	// Get responses from go routines (in a forever loop)
+	numYes := 0
+	highestN := 0
+	for numVotes := 0; numVotes < len(self.Friends); numVotes++ {
+		// pull from the channel response
+		prepareResponse := <-response
+		//resp{Command, Promised, Okay}
+		if prepareResponse.Okay {
+			numYes++
+
+			// make note of the highest n value that any replica returns to you
+			// track the highest-sequenced command that has already been accepted by one or more of the replicas
+			if prepareResponse.Promised.N > highestN {
+				highestN = prepareResponse.Promised.N
+			}
+		}
+
+		// If I have a majority
+		if numYes >= majority(len(self.Friends)) {
+			break
+		}
+	}
+
+	if numYes >= majority(len(self.Friends)) {
+		logM("You can now decide.")
+		sl2 := Slot{N: args.N.N}
+		for _, v := range self.Friends {
+			go func(v string, slot Slot, command Command) {
+				req := Request{Address: self.Address, Decide: Decide{Slot: slot, Value: command}}
+				var resp Response
+				err := call(v, "Decide", req, &resp)
+				if err != nil {
+					failure("Decide (from PAccept)")
+					return
+				}
+			}(v, sl2, args.V)
+		}
+	} else {
+		logM("You can't decide. Start over.")
+	}
+
 	return nil
 }
 
 func call(address, method string, request Request, response *Response) error {
-	client, err := rpc.DialHTTP("tcp", address)
+	client, err := rpc.DialHTTP("tcp", getAddress(address))
 	if err != nil {
 		log.Println("rpc dial: ", err)
 		return err
@@ -356,9 +468,9 @@ func help() {
 	fmt.Println("==============================================================")
 	fmt.Println("help               - Display this message.")
 	fmt.Println("dump               - Display info about the current node.")
-	fmt.Println("put <key> <value>  - Put a value .")
-	fmt.Println("get <key>          - Get a value .")
-	fmt.Println("delete <key>       - Delete a value .")
+	fmt.Println("put <key> <value>  - Put a value.")
+	fmt.Println("get <key>          - Get a value.")
+	fmt.Println("delete <key>       - Delete a value.")
 	fmt.Println("quit               - Quit the program.")
 	fmt.Println("==============================================================")
 }
@@ -378,7 +490,7 @@ func readLine(readline chan string) {
 	reader := bufio.NewReader(os.Stdin)
 	line, err := reader.ReadString('\n')
 	if err != nil {
-		log.Fatal("FRL ERROR:", err)
+		log.Fatal("READLINE ERROR:", err)
 	}
 	readline <- line
 }
@@ -472,23 +584,63 @@ func main() {
 			respChan := make(chan string, 1)
 			// store the channel in a map associated with the entire replica. it should map the address and tag number (combined into a string) to the channel
 			key := command.Address + strconv.FormatInt(command.Tag, 10)
-			fmt.Println(key)
 			command.Key = key
 			me.Acks[key] = respChan
+			log.Println("Key:", command.Key)
 
-			req := Request{PPrepare: PPrepare{Command: command}}
+			req := Request{Address: me.Address, PPrepare: PPrepare{Command: command}}
 			var resp Response
-			err := call(getAddress(me.Address), "PPrepare", req, &resp)
+			err := call(me.Address, "PPrepare", req, &resp)
 			if err != nil {
 				failure("PPrepare")
 				continue
 			}
 
-			// TODO: whenever a decision is applied, check if the command has a channel waiting for it by generating the same address/tag key and looking it up.
-				// if found send the result across the channel, then remove the channel from the map and throw it away
-				// if it isn't found, do nothing; the command was proposed on a different replica
+			logM("DONE: " + <-me.Acks[key])
 		} else if strings.ToLower(l[0]) == "put" {
+			var command Command
+			command.Command = strings.Join(l, " ")
+			command.Address = me.Address
+			// Assign the command a tag
+			command.Tag = time.Now().Unix()
+			// create a string channel with capacity 1 where the response to the command can be communicated back to the shell code that issued the command
+			respChan := make(chan string, 1)
+			// store the channel in a map associated with the entire replica. it should map the address and tag number (combined into a string) to the channel
+			key := command.Address + strconv.FormatInt(command.Tag, 10)
+			command.Key = key
+			me.Acks[key] = respChan
+
+			req := Request{Address: me.Address, PPrepare: PPrepare{Command: command}}
+			var resp Response
+			err := call(me.Address, "PPrepare", req, &resp)
+			if err != nil {
+				failure("PPrepare")
+				continue
+			}
+
+			logM("DONE: " + <-me.Acks[key])
 		} else if strings.ToLower(l[0]) == "delete" {
+			var command Command
+			command.Command = strings.Join(l, " ")
+			command.Address = me.Address
+			// Assign the command a tag
+			command.Tag = time.Now().Unix()
+			// create a string channel with capacity 1 where the response to the command can be communicated back to the shell code that issued the command
+			respChan := make(chan string, 1)
+			// store the channel in a map associated with the entire replica. it should map the address and tag number (combined into a string) to the channel
+			key := command.Address + strconv.FormatInt(command.Tag, 10)
+			command.Key = key
+			me.Acks[key] = respChan
+
+			req := Request{Address: me.Address, PPrepare: PPrepare{Command: command}}
+			var resp Response
+			err := call(me.Address, "PPrepare", req, &resp)
+			if err != nil {
+				failure("PPrepare")
+				continue
+			}
+
+			logM("DONE: " + <-me.Acks[key])
 		} else if strings.ToLower(l[0]) == "ping" {
 			for _, v := range me.Friends {
 				address := ":" + v
