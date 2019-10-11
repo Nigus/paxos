@@ -1,7 +1,5 @@
 /*
- * Paxos
- * CS 3410
- * Ren Quinn
+ * Paxos distributed system
  *
  */
 
